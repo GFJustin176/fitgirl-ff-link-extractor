@@ -969,7 +969,8 @@ class FitgirlExtractorApp:
                         direct_url = extract_one(driver, link, filename)
                         if direct_url:
                             resolved_any = True
-                            self.root.after(0, self.update_ui, None, i, None, direct_url)
+                            final_direct = _ensure_filename_in_url(direct_url, filename)
+                            self.root.after(0, self.update_ui, None, i, None, final_direct)
                         else:
                             self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
                             fk_link = self.get_fk_fallback(link) or self.get_fk_fallback(filename)
