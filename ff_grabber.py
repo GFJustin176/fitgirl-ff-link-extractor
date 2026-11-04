@@ -65,6 +65,17 @@ def extract_fk_file_code(fk_link):
     return m.group(1) if m else ""
 
 
+def _ensure_filename_in_url(url, filename):
+    """Append &file=<filename> when a direct URL does not end with the archive filename (needed by JDownloader 2)."""
+    if not url or not filename:
+        return url
+    clean_name = unquote(filename).strip()
+    if not clean_name or url.lower().endswith(clean_name.lower()):
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}file={clean_name}"
+
+
 def extract_filekeeper_one(fk_link, filename, drv=None):
     """
     Extract direct download URL from a FileKeeper.net link.
@@ -102,10 +113,10 @@ def extract_filekeeper_one(fk_link, filename, drv=None):
             r2 = s.post(r1.url, data=post_data, allow_redirects=False, timeout=12)
             loc = r2.headers.get("Location")
             if loc and loc.startswith("http"):
-                return loc
+                return _ensure_filename_in_url(loc, filename)
             m_link = re.search(r'(https?://[^\s"\'<>]+(?:/f/|/d/)[^\s"\'<>]+)', r2.text or "")
             if m_link:
-                return m_link.group(1)
+                return _ensure_filename_in_url(m_link.group(1), filename)
     except Exception as e:
         print(f"FileKeeper fast path failed: {e}")
 
@@ -140,7 +151,7 @@ def extract_filekeeper_one(fk_link, filename, drv=None):
                 }).catch(e => cb(null));
                 """)
                 if direct and direct.startswith("http"):
-                    return direct
+                    return _ensure_filename_in_url(direct, filename)
         except Exception:
             pass
 
@@ -363,6 +374,7 @@ class FitgirlExtractorApp:
 
         self.text_area = tk.Text(output_frame, wrap="none", font=("Consolas", 9), height=10)
         self.text_area.grid(row=0, column=0, sticky="nsew")
+        self.text_area.bind("<Double-Button-1>", self._select_full_output_line)
         
         scrollbar_y = ttk.Scrollbar(output_frame, orient="vertical", command=self.text_area.yview)
         scrollbar_y.grid(row=0, column=1, sticky="ns")
@@ -509,8 +521,21 @@ class FitgirlExtractorApp:
         for var in self.checkbox_vars.values():
             var.set(False)
 
+    def _select_full_output_line(self, event):
+        """Select the entire line on double-click so URLs with hyphens are never truncated."""
+        idx = self.text_area.index(f"@{event.x},{event.y}")
+        line = idx.split(".")[0]
+        self.text_area.tag_remove("sel", "1.0", tk.END)
+        self.text_area.tag_add("sel", f"{line}.0", f"{line}.end")
+        return "break"
+
     def copy_to_clipboard(self):
-        links = self.text_area.get(1.0, tk.END).strip()
+        raw_text = self.text_area.get(1.0, tk.END).strip()
+        valid_links = [
+            ln.strip() for ln in raw_text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        links = "\n".join(valid_links) if valid_links else raw_text
         if links:
             self.root.clipboard_clear()
             self.root.clipboard_append(links)
