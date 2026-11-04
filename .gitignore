@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+graphify-out/
+GEMINI.md
+AGENTS.md
+tasks/
+tests/
+SPEC.md

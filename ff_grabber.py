@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
+from urllib.parse import unquote
 
 FF_LINK_RE = re.compile(
     r"https?://(?:www\.)?fuckingfast\.co/[^\s\"'<>\]]+",
@@ -38,6 +39,79 @@ def extract_ff_links(text):
             seen.add(url)
             links.append(url)
     return links
+
+
+DN_LINK_RE = re.compile(
+    r"https?://(?:www\.)?datanodes\.to/[^\s\"'<>\]]+",
+    re.IGNORECASE,
+)
+
+
+def extract_dn_links(text):
+    """Pull unique datanodes.to URLs from HTML, markdown, or plain text."""
+    links = []
+    seen = set()
+    for match in DN_LINK_RE.findall(text or ""):
+        url = match.rstrip(").,;]")
+        if url not in seen:
+            seen.add(url)
+            links.append(url)
+    return links
+
+
+def normalize_part_name(url_or_name):
+    """Extract and normalize archive filename from a FuckingFast or DataNodes URL."""
+    s = (url_or_name or "").strip()
+    raw = s.split("#")[-1] if "#" in s else s.rstrip("/").split("/")[-1]
+    return unquote(raw).strip().lower()
+
+
+def is_ff_dead_page(html):
+    """Return True when FuckingFast page indicates the file is missing/removed."""
+    if not html:
+        return False
+    lower = html.lower()
+    if "hx-post=" in lower or "window.open(" in lower:
+        return False
+    if "just a moment" in lower or "cf-turnstile" in lower:
+        return False
+    dead_markers = (
+        "file not found",
+        "file not found or deleted",
+        "<title>not found</title>",
+        "404 not found",
+        "could not be found",
+        "file has been removed",
+        "no longer available",
+        "doesn't exist",
+        "does not exist",
+    )
+    return any(m in lower for m in dead_markers)
+
+
+def extract_dn_file_code(dn_link):
+    """Extract the file ID segment from a datanodes.to/<code_id>/<filename> URL."""
+    m = re.search(r"datanodes\.to/([A-Za-z0-9]+)", dn_link or "", re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def parse_dn_download_response(result):
+    """Parse DataNodes /download response (JSON or HTML/redirect) into a direct URL."""
+    if not result or result == "ERROR":
+        return None
+    text = str(result).strip()
+    if text.startswith("http://") or text.startswith("https://"):
+        return text
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and data.get("url"):
+            url = unquote(str(data["url"])).strip()
+            if url.startswith("http"):
+                return url
+    except Exception:
+        pass
+    m = re.search(r'(https?://[^\s"\'<>]+datanodes\.to/(?:files|d|dl)/[^\s"\'<>]+)', unquote(text))
+    return m.group(1) if m else None
 
 
 def decrypt_privatebin_paste(paste_url):
@@ -110,6 +184,7 @@ class FitgirlExtractorApp:
         self.root.rowconfigure(5, weight=1) # Output area
 
         self.checkbox_vars = {}  # Store {url: BooleanVar}
+        self.dn_fallback_map = {}  # Store {normalized_filename: datanodes_url}
         self.checkbox_list = []
         self.widget_to_index = {}
         self.last_clicked_idx = None
@@ -413,6 +488,7 @@ class FitgirlExtractorApp:
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
         self.checkbox_vars.clear()
+        self.dn_fallback_map.clear()
         self.checkbox_list.clear()
         self.widget_to_index.clear()
         self.last_clicked_idx = None
@@ -420,11 +496,35 @@ class FitgirlExtractorApp:
         thread = threading.Thread(target=self.run_fetch, args=(raw,), daemon=True)
         thread.start()
 
+    def _index_dn_links(self, text):
+        if not hasattr(self, "dn_fallback_map"):
+            self.dn_fallback_map = {}
+        for dn_url in extract_dn_links(text):
+            key = normalize_part_name(dn_url)
+            if key and key not in self.dn_fallback_map:
+                self.dn_fallback_map[key] = dn_url
+
+    def get_dn_fallback(self, filename_or_url):
+        if not getattr(self, "dn_fallback_map", None):
+            return None
+        key = normalize_part_name(filename_or_url)
+        if key in self.dn_fallback_map:
+            return self.dn_fallback_map[key]
+        part_match = re.search(r"(part\d+\.(?:rar|zip|7z)|fg-[^\s.]+\.bin|setup[^\s]*\.exe)$", key)
+        if part_match:
+            suffix = part_match.group(1)
+            matches = [u for k, u in self.dn_fallback_map.items() if k.endswith(suffix)]
+            if len(matches) == 1:
+                return matches[0]
+        return None
+
     def _links_from_paste_url(self, paste_url):
         paste_text = decrypt_privatebin_paste(paste_url)
+        self._index_dn_links(paste_text)
         return extract_ff_links(paste_text)
 
     def _links_from_page_html(self, html):
+        self._index_dn_links(html)
         links = extract_ff_links(html)
         soup = BeautifulSoup(html, "html.parser")
         paste_urls = []
@@ -444,6 +544,7 @@ class FitgirlExtractorApp:
         return links
 
     def run_fetch(self, raw):
+        self._index_dn_links(raw)
         try:
             ff_links = []
             non_empty = [ln.strip() for ln in raw.splitlines() if ln.strip()]
@@ -518,7 +619,9 @@ class FitgirlExtractorApp:
             chk.bind("<Shift-ButtonPress-1>", lambda e, i=idx: self._on_chk_shift_press(e, i))
             chk.bind("<B1-Motion>", self._on_chk_drag)
 
-        self.status_var.set(f"Found {len(links)} parts. (Tip: Shift+Click or Drag to multi-select)")
+        dn_count = len(getattr(self, "dn_fallback_map", {}))
+        dn_note = f" [{dn_count} DataNodes fallbacks ready]" if dn_count else ""
+        self.status_var.set(f"Found {len(links)} parts{dn_note}. (Tip: Shift+Click or Drag to multi-select)")
         self.fetch_btn.config(state="normal")
         self.extract_btn.config(state="normal")
 
@@ -639,6 +742,7 @@ class FitgirlExtractorApp:
             if len(drv.window_handles) < 2:
                 try:
                     drv.execute_script("window.open('about:blank','_blank');")
+                    drv.switch_to.window(handles[0])
                 except Exception:
                     pass
 
@@ -696,6 +800,9 @@ class FitgirlExtractorApp:
                     time.sleep(1)
                     page_html = drv.page_source
                     last_html = page_html
+
+                    if is_ff_dead_page(page_html):
+                        return None
 
                     match_old = re.search(r'window\.open\("([^"]+)"\)', page_html)
                     if match_old:
@@ -765,6 +872,159 @@ class FitgirlExtractorApp:
                     captcha_blocked += 1
                 return None
 
+            def extract_datanodes_one(drv, dn_link, filename):
+                file_code = extract_dn_file_code(dn_link)
+                if not file_code:
+                    return None
+                ensure_window(drv)
+                active_handle = drv.current_window_handle
+                try:
+                    drv.switch_to.window(active_handle)
+                except Exception:
+                    pass
+
+                dn_hook_js = """
+                window.__capturedDirectUrl = null;
+                if (!window.__fetchIntercepted) {
+                    window.__fetchIntercepted = true;
+                    const _origFetch = window.fetch;
+                    window.fetch = async function(...args) {
+                        const res = await _origFetch.apply(this, args);
+                        try {
+                            const clone = res.clone();
+                            const data = await clone.json();
+                            if (data && data.url) {
+                                window.__capturedDirectUrl = decodeURIComponent(data.url);
+                                return new Response(JSON.stringify({}), {
+                                    status: res.status,
+                                    statusText: res.statusText,
+                                    headers: res.headers
+                                });
+                            }
+                        } catch (e) {}
+                        return res;
+                    };
+                }
+                """
+                try:
+                    drv.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": dn_hook_js})
+                except Exception:
+                    pass
+
+                drv.get(dn_link)
+
+                # Step 1: Remove disabled attribute on #method_free and submit #downloadForm cleanly to reach Step 2
+                for _ in range(12):
+                    time.sleep(1)
+                    try:
+                        if drv.current_window_handle != active_handle and active_handle in drv.window_handles:
+                            drv.switch_to.window(active_handle)
+                    except Exception:
+                        pass
+                    page_html = drv.page_source or ""
+                    if is_ff_dead_page(page_html):
+                        return None
+                    if "Step 2 of 2" in page_html or "Start Download" in page_html or "cf-turnstile" in page_html:
+                        break
+                    try:
+                        adv = drv.execute_script("""
+                        var f = document.getElementById('downloadForm');
+                        var btn = document.getElementById('method_free') || document.querySelector('button[name="method_free"]');
+                        if (f && btn) {
+                            btn.disabled = false;
+                            btn.removeAttribute('disabled');
+                            var hidden = document.createElement('input');
+                            hidden.type = 'hidden';
+                            hidden.name = 'method_free';
+                            hidden.value = btn.value || 'Free Download >>';
+                            f.appendChild(hidden);
+                            HTMLFormElement.prototype.submit.call(f);
+                            return true;
+                        }
+                        return false;
+                        """)
+                        if adv:
+                            time.sleep(2)
+                            page_html = drv.page_source or ""
+                            if "Step 2 of 2" in page_html or "cf-turnstile" in page_html:
+                                break
+                    except Exception:
+                        pass
+
+                # Ensure fetch interceptor is also active on current document (fallback for non-CDP browsers)
+                try:
+                    drv.execute_script(dn_hook_js)
+                except Exception:
+                    pass
+
+                clicked_free = False
+                for tick in range(45):
+                    time.sleep(1)
+                    try:
+                        if drv.current_window_handle != active_handle and active_handle in drv.window_handles:
+                            drv.switch_to.window(active_handle)
+                    except Exception:
+                        pass
+
+                    direct = None
+                    try:
+                        direct = drv.execute_script("return window.__capturedDirectUrl;")
+                    except Exception:
+                        pass
+                    if direct:
+                        return direct
+
+                    page_html = drv.page_source or ""
+                    direct_dom = parse_dn_download_response(page_html)
+                    if direct_dom:
+                        return direct_dom
+
+                    # Check for turnstile captcha widget
+                    try:
+                        turnstile_val = drv.execute_script(
+                            "return (document.querySelector('[name=\"cf-turnstile-response\"]') || {}).value || '';"
+                        )
+                        if not turnstile_val and "cf-turnstile" in page_html and tick in (3, 7, 12):
+                            try:
+                                el = drv.find_element(By.CLASS_NAME, "cf-turnstile")
+                                drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                                ActionChains(drv).move_to_element_with_offset(
+                                    el, 30 - el.size['width'] // 2, 0
+                                ).click().perform()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                    # Click 'Free Download' button to start the countdown
+                    if not clicked_free:
+                        try:
+                            clicked_free = drv.execute_script("""
+                            var btns = Array.from(document.querySelectorAll('button'));
+                            var freeBtn = btns.find(b => (b.innerText || '').includes('Free Download'));
+                            if (freeBtn) {
+                                freeBtn.click();
+                                return true;
+                            }
+                            return false;
+                            """)
+                        except Exception:
+                            pass
+
+                    # Click 'Start Download' button when countdown finishes
+                    try:
+                        drv.execute_script("""
+                        var btns = Array.from(document.querySelectorAll('button'));
+                        var startBtn = btns.find(b => (b.innerText || '').includes('Start Download'));
+                        if (startBtn) {
+                            startBtn.click();
+                        }
+                        """)
+                    except Exception:
+                        pass
+
+                return None
+
             for i, link in enumerate(links, 1):
                 filename = link.split('#')[-1] if '#' in link else link.split('/')[-1]
                 self.root.after(0, self.update_ui, f"Processing [{i}/{total}]: {filename}")
@@ -777,6 +1037,15 @@ class FitgirlExtractorApp:
                             self.root.after(0, self.update_ui, None, i, None, direct_url)
                         else:
                             self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
+                            dn_link = self.get_dn_fallback(link) or self.get_dn_fallback(filename)
+                            if dn_link:
+                                self.root.after(0, self.update_ui, f"Fallback DataNodes [{i}/{total}]: {filename}")
+                                dn_direct = extract_datanodes_one(driver, dn_link, filename)
+                                if dn_direct:
+                                    resolved_any = True
+                                    self.root.after(0, self.update_ui, None, i, None, dn_direct)
+                                else:
+                                    self.root.after(0, self.update_ui, None, i, None, f"# FALLBACK FAILED: {filename} ({dn_link})")
                         break
                     except Exception as e:
                         if attempt == 0 and session_is_dead(e):
